@@ -173,6 +173,9 @@ func (s *Service) Run(ctx context.Context) error {
 		s.hooks.OnBeforeStart(s.currentConfig())
 	}
 
+	s.restoreSessionBindings()
+	go s.saveSessionBindingsEvery(ctx, sessionBindingsSaveInterval)
+
 	s.serverErr = make(chan error, 1)
 	go func() {
 		if errStart := s.server.Start(); errStart != nil {
@@ -240,6 +243,8 @@ func (s *Service) Run(ctx context.Context) error {
 		log.Debug("service context cancelled, shutting down...")
 		return ctx.Err()
 	case errServer := <-s.serverErr:
+		// A drain closes the listener, so the server returns at once; the requests in flight still finish first.
+		s.waitForDrain()
 		return errServer
 	}
 }

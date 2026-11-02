@@ -75,6 +75,9 @@ type Service struct {
 	// serverErr channel for server startup/shutdown errors.
 	serverErr chan error
 
+	// handover tracks a hot swap to a new core: prepared, draining, and when the drain has finished.
+	handover handoverState
+
 	// watcher handles file system monitoring.
 	watcher *WatcherWrapper
 

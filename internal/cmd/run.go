@@ -61,6 +61,10 @@ func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPass
 		return
 	}
 
+	runCtx, stopRun := context.WithCancel(runCtx)
+	defer stopRun()
+	watchHandoverSignals(runCtx, service, stopRun)
+
 	err = service.Run(runCtx)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Errorf("proxy service exited with error: %v", err)

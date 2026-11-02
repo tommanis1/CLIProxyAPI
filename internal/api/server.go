@@ -300,7 +300,7 @@ func (s *Server) Start() error {
 	}
 
 	addr := s.server.Addr
-	listener, errListen := net.Listen("tcp", addr)
+	listener, errListen := listenTCP(addr)
 	if errListen != nil {
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}
@@ -406,6 +406,27 @@ func (s *Server) Start() error {
 		}
 		return nil
 	}
+}
+
+// Drain hands the port over during a hot swap: it stops accepting connections (a new core bound to the same
+// port takes the new ones) and waits until the requests in flight, streams included, have finished or ctx ends.
+func (s *Server) Drain(ctx context.Context) error {
+	s.listenerMu.Lock()
+	muxBase := s.muxBaseListener
+	s.muxBaseListener = nil
+	s.listenerMu.Unlock()
+	if muxBase != nil {
+		if errClose := muxBase.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			log.Debugf("failed to close shared listener for drain: %v", errClose)
+		}
+	}
+	if s.server == nil {
+		return nil
+	}
+	if errShutdown := s.server.Shutdown(ctx); errShutdown != nil && !errors.Is(errShutdown, http.ErrServerClosed) {
+		return errShutdown
+	}
+	return nil
 }
 
 // Stop closes listeners and immediately shuts down the API server without waiting for active connections.
