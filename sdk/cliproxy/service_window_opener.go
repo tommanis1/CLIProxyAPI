@@ -3,9 +3,11 @@ package cliproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,22 +21,35 @@ import (
 
 // Window opener: a Claude subscription's 5-hour window starts at the first request after the previous one
 // reset. An account nobody uses for a while starts its next window late, at whatever moment work arrives.
-// The opener checks every Claude account's usage (Anthropic's usage endpoint, which costs nothing) and,
+// The opener reads each Claude account's usage (Anthropic's usage endpoint, which costs no tokens) and,
 // when an account has no open 5-hour window, sends it one tiny message, so a new window starts right away.
 // Accounts with a weekly cap are opened only while their weekly utilization is under the ceiling for
 // their plan: a window on an account whose week is nearly spent buys nothing.
+//
+// The usage endpoint is rate limited, so an account is read again only when its state can have changed:
+// an open window at its reset, an account over its ceiling or without a 5-hour limit after a long pause,
+// and after a refusal no sooner than Anthropic's Retry-After.
 
 const (
 	claudeUsageURL   = "https://api.anthropic.com/api/oauth/usage"
 	claudeProfileURL = "https://api.anthropic.com/api/oauth/profile"
 	claudeOAuthBeta  = "oauth-2025-04-20"
 
+	// windowOpenerDefaultInterval is how often the opener looks for accounts that are due; only due accounts
+	// are read.
 	windowOpenerDefaultInterval = time.Minute
 	windowOpenerDefaultModel    = "claude-haiku-5-5"
 	windowOpenerDefaultPrompt   = "Respond with zoo7"
-	// windowOpenerRetryAfter spaces attempts on one account, so an opening the usage endpoint does not show
-	// yet, or one that failed, is not repeated every check.
-	windowOpenerRetryAfter = 5 * time.Minute
+	// windowOpenerAfterReset is how long after a window's reset time it is read again, so the reset has
+	// happened by then.
+	windowOpenerAfterReset = 30 * time.Second
+	// windowOpenerConfirm is when an account is read again after an opening message, to see the new window.
+	windowOpenerConfirm = 2 * time.Minute
+	// windowOpenerIdle is the pause for a state only use or a weekly reset changes: over the weekly ceiling,
+	// or no 5-hour limit. Real traffic on the account opens its window by itself meanwhile.
+	windowOpenerIdle = 30 * time.Minute
+	// windowOpenerFailed is the pause after an error with no Retry-After, and after a failed opening.
+	windowOpenerFailed = 10 * time.Minute
 	// windowOpenerProfileTTL is how long an account's plan is cached.
 	windowOpenerProfileTTL = 24 * time.Hour
 )
@@ -57,12 +72,21 @@ type claudeProfile struct {
 	} `json:"organization"`
 }
 
+// claudeOAuthError is a refused call to an account endpoint; retryAfter is Anthropic's Retry-After, if any.
+type claudeOAuthError struct {
+	status     int
+	body       string
+	retryAfter time.Duration
+}
+
+func (e *claudeOAuthError) Error() string { return fmt.Sprintf("HTTP %d: %s", e.status, e.body) }
+
 // windowOpenerAccount is what the opener remembers about one credential between checks.
 type windowOpenerAccount struct {
 	plan        string
 	planFetched time.Time
-	lastAttempt time.Time
-	lastState   string // the last decision logged, so a steady state is logged once
+	nextCheck   time.Time // the account is not read before this
+	lastState   string    // the last decision logged, so a steady state is logged once
 }
 
 type windowOpener struct {
@@ -84,8 +108,8 @@ func (o *windowOpener) account(id string) *windowOpenerAccount {
 	return a
 }
 
-// runWindowOpener checks all Claude accounts once per interval while the opener is enabled. The settings
-// are read on every round, so a config reload takes effect without a restart.
+// runWindowOpener checks the due Claude accounts once per interval while the opener is enabled. The
+// settings are read on every round, so a config reload takes effect without a restart.
 func (s *Service) runWindowOpener(ctx context.Context) {
 	for {
 		cfg := s.currentConfig()
@@ -104,7 +128,9 @@ func (s *Service) runWindowOpener(ctx context.Context) {
 			continue
 		}
 		for _, auth := range s.claudeOAuthAccounts() {
-			s.checkWindow(ctx, cfg, auth)
+			if account := s.windowOpener.account(auth.ID); !time.Now().Before(account.nextCheck) {
+				account.nextCheck = time.Now().Add(s.checkWindow(ctx, cfg, auth, account))
+			}
 		}
 	}
 }
@@ -134,9 +160,9 @@ func claudeAccessToken(auth *coreauth.Auth) string {
 	return strings.TrimSpace(token)
 }
 
-// checkWindow opens the account's 5-hour window when it has none and its plan's weekly ceiling allows.
-func (s *Service) checkWindow(ctx context.Context, cfg *config.Config, auth *coreauth.Auth) {
-	account := s.windowOpener.account(auth.ID)
+// checkWindow opens the account's 5-hour window when it has none and its plan's weekly ceiling allows. It
+// returns how long to wait before reading this account again.
+func (s *Service) checkWindow(ctx context.Context, cfg *config.Config, auth *coreauth.Auth, account *windowOpenerAccount) time.Duration {
 	name := auth.Label
 	if name == "" {
 		name = auth.ID
@@ -147,46 +173,49 @@ func (s *Service) checkWindow(ctx context.Context, cfg *config.Config, auth *cor
 			log.Infof("window opener: %s: "+state, append([]any{name}, args...)...)
 		}
 	}
+	refused := func(what string, err error) time.Duration {
+		wait := windowOpenerFailed
+		var oauthErr *claudeOAuthError
+		if errors.As(err, &oauthErr) && oauthErr.retryAfter > 0 {
+			wait = oauthErr.retryAfter
+		}
+		note(what+" unknown (%v); next try in %s", err, wait.Round(time.Second))
+		return wait
+	}
 
 	if account.plan == "" || time.Since(account.planFetched) > windowOpenerProfileTTL {
 		var profile claudeProfile
 		if err := s.claudeOAuthGet(ctx, cfg, auth, claudeProfileURL, &profile); err != nil {
-			note("plan unknown (%v)", err)
-			return
+			return refused("plan", err)
 		}
 		account.plan, account.planFetched = profile.Organization.OrganizationType, time.Now()
 	}
 	var usage claudeUsage
 	if err := s.claudeOAuthGet(ctx, cfg, auth, claudeUsageURL, &usage); err != nil {
-		note("usage unknown (%v)", err)
-		return
+		return refused("usage", err)
 	}
 	now := time.Now()
 	switch {
 	case usage.FiveHour == nil:
 		note("no 5-hour limit on this account (%s)", account.plan)
-		return
+		return windowOpenerIdle
 	case usage.FiveHour.ResetsAt != nil && usage.FiveHour.ResetsAt.After(now):
-		note("window open")
-		return
+		note("window open until %s", usage.FiveHour.ResetsAt.Local().Format("15:04"))
+		return usage.FiveHour.ResetsAt.Sub(now) + windowOpenerAfterReset
 	}
 	ceiling, capped := windowOpenerCeiling(cfg, account.plan)
 	if capped && usage.SevenDay != nil && usage.SevenDay.Utilization >= ceiling {
 		note("window closed, not opened: weekly %.0f%% is at or over the %s ceiling %.0f%%",
 			usage.SevenDay.Utilization, account.plan, ceiling)
-		return
-	}
-	if now.Sub(account.lastAttempt) < windowOpenerRetryAfter {
-		return
-	}
-	account.lastAttempt = now
-	if err := s.openWindow(ctx, cfg, auth); err != nil {
-		account.lastState = ""
-		log.Warnf("window opener: %s: opening failed: %v", name, err)
-		return
+		return windowOpenerIdle
 	}
 	account.lastState = ""
+	if err := s.openWindow(ctx, cfg, auth); err != nil {
+		log.Warnf("window opener: %s: opening failed: %v", name, err)
+		return windowOpenerFailed
+	}
 	log.Infof("window opener: %s: window opened (%s)", name, account.plan)
+	return windowOpenerConfirm
 }
 
 func windowOpenerCeiling(cfg *config.Config, plan string) (float64, bool) {
@@ -234,7 +263,7 @@ func (s *Service) openWindow(ctx context.Context, cfg *config.Config, auth *core
 	return nil
 }
 
-// claudeOAuthGet reads one of Anthropic's OAuth account endpoints with the credential's token.
+// claudeOAuthGet reads one of Anthropic's OAuth account endpoints with the credential's token, once.
 func (s *Service) claudeOAuthGet(ctx context.Context, cfg *config.Config, auth *coreauth.Auth, url string, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -254,7 +283,11 @@ func (s *Service) claudeOAuthGet(ctx context.Context, cfg *config.Config, auth *
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw[:min(len(raw), 200)])))
+		e := &claudeOAuthError{status: resp.StatusCode, body: strings.TrimSpace(string(raw[:min(len(raw), 200)]))}
+		if secs, errParse := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); errParse == nil && secs > 0 {
+			e.retryAfter = time.Duration(secs) * time.Second
+		}
+		return e
 	}
 	return json.Unmarshal(raw, out)
 }
