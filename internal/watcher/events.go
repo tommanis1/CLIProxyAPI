@@ -27,11 +27,19 @@ func matchProvider(provider string, targets []string) (string, bool) {
 }
 
 func (w *Watcher) start(ctx context.Context) error {
-	if errAddConfig := w.watcher.Add(w.configPath); errAddConfig != nil {
-		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
+	// Watch the config's directory, not the file: an editor or tool that saves by replacing the file
+	// (write a temporary file, rename it over) would end a watch on the file itself, and no later change
+	// would be reloaded. handleEvent keeps only the events whose name is the config path.
+	if _, errStat := os.Stat(w.configPath); errStat != nil {
+		log.Errorf("failed to watch config file %s: %v", w.configPath, errStat)
+		return errStat
+	}
+	configDir := filepath.Dir(w.configPath)
+	if errAddConfig := w.watcher.Add(configDir); errAddConfig != nil {
+		log.Errorf("failed to watch config directory %s: %v", configDir, errAddConfig)
 		return errAddConfig
 	}
-	log.Debugf("watching config file: %s", w.configPath)
+	log.Debugf("watching config file: %s (through its directory)", w.configPath)
 
 	if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
 		log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
