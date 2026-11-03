@@ -78,6 +78,9 @@ type Service struct {
 	// handover tracks a hot swap to a new core: prepared, draining, and when the drain has finished.
 	handover handoverState
 
+	// windowOpener remembers each Claude account's plan and last opening attempt.
+	windowOpener windowOpener
+
 	// watcher handles file system monitoring.
 	watcher *WatcherWrapper
 

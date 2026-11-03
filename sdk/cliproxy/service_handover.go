@@ -27,6 +27,7 @@ const (
 
 type handoverState struct {
 	mu        sync.Mutex
+	prepared  bool // told to prepare: a new core takes over
 	draining  bool
 	drainDone chan struct{}
 	lastSaved []coreauth.SessionBindingSnapshot
@@ -115,11 +116,15 @@ func (s *Service) saveSessionBindingsEvery(ctx context.Context, interval time.Du
 	}
 }
 
-// PrepareHandover is step 1 of a hot swap: save the bindings for the new core and stop refreshing tokens.
+// PrepareHandover is step 1 of a hot swap: save the bindings for the new core and stop refreshing tokens
+// and opening windows.
 func (s *Service) PrepareHandover() {
 	if s == nil {
 		return
 	}
+	s.handover.mu.Lock()
+	s.handover.prepared = true
+	s.handover.mu.Unlock()
 	s.saveSessionBindings()
 	if s.coreManager != nil {
 		s.coreManager.StopAutoRefresh()

@@ -289,6 +289,15 @@ func (s *Server) Handler() http.Handler {
 	return s.server.Handler
 }
 
+// ModelExecutor returns the handler that runs model requests inside the process, through credential
+// selection, translation and the executors, as a client's request would run.
+func (s *Server) ModelExecutor() *handlers.BaseAPIHandler {
+	if s == nil {
+		return nil
+	}
+	return s.handlers
+}
+
 // Start begins listening for and serving HTTP or HTTPS requests.
 // It's a blocking call and will only return on an unrecoverable error.
 //

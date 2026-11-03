@@ -487,6 +487,26 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// WindowOpener opens Claude subscription 5-hour windows as soon as they reset, so each window's clock
+	// starts on time instead of at the account's next real request.
+	WindowOpener WindowOpenerConfig `yaml:"window-opener,omitempty" json:"window-opener,omitempty"`
+}
+
+// WindowOpenerConfig configures the 5-hour window opener for Claude OAuth credentials.
+type WindowOpenerConfig struct {
+	// Enabled turns the opener on. Default: false.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Interval between usage checks of every Claude credential. Default: 1m.
+	Interval string `yaml:"interval,omitempty" json:"interval,omitempty"`
+	// Model of the opening message. Default: claude-haiku-5-5.
+	Model string `yaml:"model,omitempty" json:"model,omitempty"`
+	// Prompt of the opening message. Default: "Respond with zoo7".
+	Prompt string `yaml:"prompt,omitempty" json:"prompt,omitempty"`
+	// WeeklyCeiling maps an organization type (claude_pro, claude_max, ...) to the weekly utilization in
+	// percent at or above which that account's windows are no longer opened. Types not listed have no
+	// ceiling. Default: claude_pro 70, claude_max 80.
+	WeeklyCeiling map[string]float64 `yaml:"weekly-ceiling,omitempty" json:"weekly-ceiling,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

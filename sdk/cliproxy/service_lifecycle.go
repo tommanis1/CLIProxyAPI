@@ -175,6 +175,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.restoreSessionBindings()
 	go s.saveSessionBindingsEvery(ctx, sessionBindingsSaveInterval)
+	go s.runWindowOpener(ctx)
 
 	s.serverErr = make(chan error, 1)
 	go func() {
